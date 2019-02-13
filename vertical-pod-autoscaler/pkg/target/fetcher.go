@@ -17,23 +17,100 @@ limitations under the License.
 package target
 
 import (
+	"fmt"
+	"time"
+
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/wait"
 	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1beta2"
+	"k8s.io/client-go/discovery"
+	cacheddiscovery "k8s.io/client-go/discovery/cached"
+	"k8s.io/client-go/dynamic"
+	kube_client "k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/restmapper"
+	"k8s.io/client-go/scale"
+
+	"github.com/golang/glog"
 )
 
-// VpaTargetSelectorFetcher queries API server for VPA's targetRef and returns targetSelector
+// VpaTargetSelectorFetcher gets a labelSelector used to gather Pods controlled by the given VPA.
 type VpaTargetSelectorFetcher interface {
+	// Fetch returns a labelSelector used to gather Pods controlled by the given VPA.
+	// If error is nil, the returned labelSelector is not nil.
 	Fetch(vpa *vpa_types.VerticalPodAutoscaler) (labels.Selector, error)
 }
 
 // NewVpaTargetSelectorFetcher returns new instance of VpaTargetSelectorFetcher
-func NewVpaTargetSelectorFetcher() VpaTargetSelectorFetcher {
-	return &vpaTargetSelectorFetcher{}
+func NewVpaTargetSelectorFetcher(config *rest.Config, kubeClient kube_client.Interface) VpaTargetSelectorFetcher {
+	discoveryClient, err := discovery.NewDiscoveryClientForConfig(config)
+	if err != nil {
+		glog.Fatalf("Could not create discoveryClient: %v", err)
+	}
+	resolver := scale.NewDiscoveryScaleKindResolver(discoveryClient)
+	restClient := kubeClient.CoreV1().RESTClient()
+	cachedDiscoveryClient := cacheddiscovery.NewMemCacheClient(discoveryClient)
+	mapper := restmapper.NewDeferredDiscoveryRESTMapper(cachedDiscoveryClient)
+	go wait.Until(func() {
+		mapper.Reset()
+	}, 5*time.Minute, make(chan struct{}))
+
+	scaleNamespacer := scale.New(restClient, mapper, dynamic.LegacyAPIPathResolverFunc, resolver)
+	return &vpaTargetSelectorFetcher{
+		scaleNamespacer: scaleNamespacer,
+		mapper:          mapper,
+	}
 }
 
+// vpaTargetSelectorFetcher implements VpaTargetSelectorFetcher interface
+// by querying API server for the controller pointed by VPA's targetRef
 type vpaTargetSelectorFetcher struct {
+	scaleNamespacer scale.ScalesGetter
+	mapper          apimeta.RESTMapper
 }
 
-func (*vpaTargetSelectorFetcher) Fetch(vpa *vpa_types.VerticalPodAutoscaler) (labels.Selector, error) {
+func (f *vpaTargetSelectorFetcher) Fetch(vpa *vpa_types.VerticalPodAutoscaler) (labels.Selector, error) {
+	groupVersion, err := schema.ParseGroupVersion(vpa.Spec.TargetRef.APIVersion)
+	if err != nil {
+		return nil, err
+	}
+	groupKind := schema.GroupKind{
+		Group: groupVersion.Group,
+		Kind:  vpa.Spec.TargetRef.Kind,
+	}
+	selector, err := f.getLabelSelectorFromResource(groupKind, vpa.Namespace, vpa.Spec.TargetRef.Name)
+	if err != nil {
+		return nil, err
+	}
+	if selector != nil {
+		return selector, nil
+	}
+	// TODO: handle DaemonSet too
+	return nil, fmt.Errorf("Unhandled TargetRef %s / %s / %s",
+		vpa.Spec.TargetRef.APIVersion, vpa.Spec.TargetRef.Kind, vpa.Spec.TargetRef.Name)
+}
+
+func (f *vpaTargetSelectorFetcher) getLabelSelectorFromResource(
+	groupKind schema.GroupKind, namespace, name string,
+) (labels.Selector, error) {
+	mappings, err := f.mapper.RESTMappings(groupKind)
+	if err != nil {
+		return nil, err
+	}
+	for _, mapping := range mappings {
+		groupResource := mapping.Resource.GroupResource()
+		scale, err := f.scaleNamespacer.Scales(namespace).Get(groupResource, name)
+		if err == nil {
+			selector, err := labels.Parse(scale.Status.Selector)
+			if err != nil {
+				return nil, err
+			}
+			return selector, nil
+		}
+	}
+
+	// nothing found but that's still OK, maybe our target ref does not support it
 	return nil, nil
 }

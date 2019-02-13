@@ -55,8 +55,9 @@ func main() {
 	metrics.Initialize(*address, healthCheck)
 	metrics_updater.Register()
 
-	kubeClient, vpaClient := createKubeClients()
-	updater, err := updater.NewUpdater(kubeClient, vpaClient, *minReplicas, *evictionToleranceFraction, vpa_api_util.NewCappingRecommendationProcessor(), nil, target.NewVpaTargetSelectorFetcher())
+	config, kubeClient, vpaClient := createKubeClients()
+	targetSelectorFetcher := target.NewVpaTargetSelectorFetcher(config, kubeClient)
+	updater, err := updater.NewUpdater(kubeClient, vpaClient, *minReplicas, *evictionToleranceFraction, vpa_api_util.NewCappingRecommendationProcessor(), nil, targetSelectorFetcher)
 	if err != nil {
 		glog.Fatalf("Failed to create updater: %v", err)
 	}
@@ -67,10 +68,10 @@ func main() {
 	}
 }
 
-func createKubeClients() (kube_client.Interface, *vpa_clientset.Clientset) {
+func createKubeClients() (*kube_restclient.Config, kube_client.Interface, *vpa_clientset.Clientset) {
 	config, err := kube_restclient.InClusterConfig()
 	if err != nil {
 		glog.Fatalf("Failed to build Kubernetes client : fail to create config: %v", err)
 	}
-	return kube_client.NewForConfigOrDie(config), vpa_clientset.NewForConfigOrDie(config)
+	return config, kube_client.NewForConfigOrDie(config), vpa_clientset.NewForConfigOrDie(config)
 }

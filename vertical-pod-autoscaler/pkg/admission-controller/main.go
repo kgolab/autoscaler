@@ -33,6 +33,7 @@ import (
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/metrics"
 	metrics_admission "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/metrics/admission"
 	vpa_api_util "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/vpa"
+	kube_client "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 )
 
@@ -47,11 +48,15 @@ var (
 	namespace = os.Getenv("NAMESPACE")
 )
 
-func newReadyVPALister(stopChannel <-chan struct{}) vpa_lister.VerticalPodAutoscalerLister {
+func createKubeClient() (*rest.Config, kube_client.Interface) {
 	config, err := rest.InClusterConfig()
 	if err != nil {
-		glog.Fatal(err)
+		glog.Fatalf("Failed to build Kubernetes client : fail to create config: %v", err)
 	}
+	return config, kube_client.NewForConfigOrDie(config)
+}
+
+func newReadyVPALister(config *rest.Config, stopChannel <-chan struct{}) vpa_lister.VerticalPodAutoscalerLister {
 	vpaClient := vpa_clientset.NewForConfigOrDie(config)
 	return vpa_api_util.NewAllVpasLister(vpaClient, stopChannel)
 }
@@ -66,8 +71,10 @@ func main() {
 
 	certs := initCerts(*certsConfiguration)
 	stopChannel := make(chan struct{})
-	vpaLister := newReadyVPALister(stopChannel)
-	as := logic.NewAdmissionServer(logic.NewRecommendationProvider(vpaLister, vpa_api_util.NewCappingRecommendationProcessor(), target.NewVpaTargetSelectorFetcher()), logic.NewDefaultPodPreProcessor())
+	config, kubeClient := createKubeClient()
+	vpaLister := newReadyVPALister(config, stopChannel)
+	targetSelectorFetcher := target.NewVpaTargetSelectorFetcher(config, kubeClient)
+	as := logic.NewAdmissionServer(logic.NewRecommendationProvider(vpaLister, vpa_api_util.NewCappingRecommendationProcessor(), targetSelectorFetcher), logic.NewDefaultPodPreProcessor())
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		as.Serve(w, r)
 		healthCheck.UpdateLastActivity()

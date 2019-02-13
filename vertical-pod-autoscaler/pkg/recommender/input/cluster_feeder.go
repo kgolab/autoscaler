@@ -107,7 +107,7 @@ func NewClusterStateFeeder(config *rest.Config, clusterState *model.ClusterState
 		VpaCheckpointClient: vpa_clientset.NewForConfigOrDie(config).AutoscalingV1beta2(),
 		VpaLister:           vpa_api_util.NewAllVpasLister(vpa_clientset.NewForConfigOrDie(config), make(chan struct{})),
 		ClusterState:        clusterState,
-		SelectorFetcher:     target.NewVpaTargetSelectorFetcher(),
+		SelectorFetcher:     target.NewVpaTargetSelectorFetcher(config, kubeClient),
 	}.Make()
 }
 
