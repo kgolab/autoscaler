@@ -20,7 +20,10 @@ import (
 	"fmt"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
+	apiv1 "k8s.io/api/core/v1"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -28,12 +31,19 @@ import (
 	"k8s.io/client-go/discovery"
 	cacheddiscovery "k8s.io/client-go/discovery/cached"
 	"k8s.io/client-go/dynamic"
+	appsinformer "k8s.io/client-go/informers/apps/v1"
 	kube_client "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/restmapper"
 	"k8s.io/client-go/scale"
+	"k8s.io/client-go/tools/cache"
 
 	"github.com/golang/glog"
+)
+
+const (
+	resyncPeriod time.Duration = 1 * time.Minute
+	discoveryResetPeriod time.Duration = 5 * time.Minute
 )
 
 // VpaTargetSelectorFetcher gets a labelSelector used to gather Pods controlled by the given VPA.
@@ -55,12 +65,22 @@ func NewVpaTargetSelectorFetcher(config *rest.Config, kubeClient kube_client.Int
 	mapper := restmapper.NewDeferredDiscoveryRESTMapper(cachedDiscoveryClient)
 	go wait.Until(func() {
 		mapper.Reset()
-	}, 5*time.Minute, make(chan struct{}))
+	}, discoveryResetPeriod, make(chan struct{}))
+
+	informer := appsinformer.NewDaemonSetInformer(kubeClient, apiv1.NamespaceAll,
+		resyncPeriod, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc})
+	stopCh := make(chan struct{})
+	go informer.Run(stopCh)
+	synced := cache.WaitForCacheSync(stopCh, informer.HasSynced)
+	if !synced {
+		glog.Fatalf("Could not sync cache for DaemonSets: %v", err)
+	}
 
 	scaleNamespacer := scale.New(restClient, mapper, dynamic.LegacyAPIPathResolverFunc, resolver)
 	return &vpaTargetSelectorFetcher{
 		scaleNamespacer: scaleNamespacer,
 		mapper:          mapper,
+		daemonInformer:  informer,
 	}
 }
 
@@ -69,9 +89,16 @@ func NewVpaTargetSelectorFetcher(config *rest.Config, kubeClient kube_client.Int
 type vpaTargetSelectorFetcher struct {
 	scaleNamespacer scale.ScalesGetter
 	mapper          apimeta.RESTMapper
+	daemonInformer  cache.SharedIndexInformer
 }
 
 func (f *vpaTargetSelectorFetcher) Fetch(vpa *vpa_types.VerticalPodAutoscaler) (labels.Selector, error) {
+	// treat DaemonSet differently, it does not support scale subresource
+	if vpa.Spec.TargetRef.Kind == "DaemonSet" {
+		return f.getLabelSelectorForDaemonSet(vpa.Namespace, vpa.Spec.TargetRef.Name)
+	}
+
+	// not on a list of known controllers, use scale sub-resource
 	groupVersion, err := schema.ParseGroupVersion(vpa.Spec.TargetRef.APIVersion)
 	if err != nil {
 		return nil, err
@@ -80,16 +107,30 @@ func (f *vpaTargetSelectorFetcher) Fetch(vpa *vpa_types.VerticalPodAutoscaler) (
 		Group: groupVersion.Group,
 		Kind:  vpa.Spec.TargetRef.Kind,
 	}
+
 	selector, err := f.getLabelSelectorFromResource(groupKind, vpa.Namespace, vpa.Spec.TargetRef.Name)
+	if err != nil {
+		return nil, fmt.Errorf("Unhandled TargetRef %s / %s / %s, last error %v",
+			vpa.Spec.TargetRef.APIVersion, vpa.Spec.TargetRef.Kind, vpa.Spec.TargetRef.Name, err)
+	}
+	return selector, nil
+}
+
+func (f *vpaTargetSelectorFetcher) getLabelSelectorForDaemonSet(namespace, name string) (labels.Selector, error) {
+	daemonObj, exists, err := f.daemonInformer.GetStore().GetByKey(namespace + "/" + name)
 	if err != nil {
 		return nil, err
 	}
-	if selector != nil {
-		return selector, nil
+	if ! exists {
+		return nil, fmt.Errorf("DaemonSet %s/%s does not exist", namespace, name)
 	}
-	// TODO: handle DaemonSet too
-	return nil, fmt.Errorf("Unhandled TargetRef %s / %s / %s",
-		vpa.Spec.TargetRef.APIVersion, vpa.Spec.TargetRef.Kind, vpa.Spec.TargetRef.Name)
+
+	daemon, ok := daemonObj.(*appsv1.DaemonSet)
+	if ! ok {
+		return nil, fmt.Errorf("Failed to parse DaemonSet %s/%s", namespace, name)
+	}
+
+	return metav1.LabelSelectorAsSelector(daemon.Spec.Selector)
 }
 
 func (f *vpaTargetSelectorFetcher) getLabelSelectorFromResource(
@@ -99,6 +140,8 @@ func (f *vpaTargetSelectorFetcher) getLabelSelectorFromResource(
 	if err != nil {
 		return nil, err
 	}
+
+	var lastError error
 	for _, mapping := range mappings {
 		groupResource := mapping.Resource.GroupResource()
 		scale, err := f.scaleNamespacer.Scales(namespace).Get(groupResource, name)
@@ -108,9 +151,11 @@ func (f *vpaTargetSelectorFetcher) getLabelSelectorFromResource(
 				return nil, err
 			}
 			return selector, nil
+		} else {
+			lastError = err
 		}
 	}
 
-	// nothing found but that's still OK, maybe our target ref does not support it
-	return nil, nil
+	// nothing found, apparently the resource does support scale (or we lack RBAC)
+	return nil, lastError
 }

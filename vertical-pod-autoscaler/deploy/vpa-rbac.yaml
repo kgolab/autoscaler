@@ -187,7 +187,7 @@ subjects:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: system:scale-reader
+  name: system:vpa-target-reader
 rules:
 - apiGroups:
   - ""
@@ -202,6 +202,7 @@ rules:
   resources:
   - statefulsets/scale
   - replicasets/scale
+  - daemonsets
   verbs:
   - get
   - list
@@ -218,11 +219,11 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: system:vpa-scale-reader-binding
+  name: system:vpa-vpa-target-reader-binding
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: system:scale-reader
+  name: system:vpa-target-reader
 subjects:
 - kind: ServiceAccount
   name: vpa-recommender
